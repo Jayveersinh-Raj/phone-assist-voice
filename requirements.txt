@@ -1,0 +1,18 @@
+fastapi
+uvicorn
+numpy
+webrtcvad
+openai-whisper
+openai
+torch  # Required for whisper
+python-multipart
+faster-whisper
+soundfile
+pyaudio
+transformers
+sentencepiece
+python-dotenv
+deepgram-sdk
+pytest
+pytest-asyncio
+pytest-mock
