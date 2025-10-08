@@ -1,13 +1,9 @@
 """
-Deepgram STT provider implementation.
+Deepgram STT provider implementation (streaming-focused).
 """
 import os
-import asyncio
 from typing import Optional, Dict, Any
-import numpy as np
-from deepgram import DeepgramClient, PrerecordedOptions, FileSource
-import tempfile
-import soundfile as sf
+from deepgram import DeepgramClient
 from .base import STTProvider
 
 
@@ -23,12 +19,9 @@ class DeepgramSTT(STTProvider):
         """
         super().__init__(config)
         
-        # Get API key from config or environment
-        api_key = self.config.get('api_key') or os.getenv('DEEPGRAM_API_KEY')
-        if not api_key:
-            raise ValueError("Deepgram API key is required. Set DEEPGRAM_API_KEY environment variable or pass in config.")
-        
-        self.client = DeepgramClient(api_key)
+        # Get API key from config or environment (lazy client init later)
+        self.api_key = self.config.get('api_key') or os.getenv('DEEPGRAM_API_KEY')
+        self.client = None
         self.language = self.config.get('language', 'en')
         self.model = self.config.get('model', 'nova-2')
         self.smart_format = self.config.get('smart_format', True)
@@ -48,75 +41,15 @@ class DeepgramSTT(STTProvider):
             'zu', 'xh', 'af'
         ]
     
-    def transcribe(self, audio_data: np.ndarray, sample_rate: int = 16000) -> str:
+    def transcribe(self, audio_data, sample_rate: int = 16000) -> str:
         """
-        Transcribe audio data using Deepgram.
-        
-        Args:
-            audio_data: Audio data as numpy array
-            sample_rate: Sample rate of the audio
-            
-        Returns:
-            Transcribed text
+        Placeholder: Deepgram live streaming is used in the server via WebSocket.
+        This method is intentionally a no-op to keep factory/provider listings working.
         """
-        try:
-            # Convert numpy array to temporary WAV file
-            with tempfile.NamedTemporaryFile(suffix='.wav', delete=False) as temp_file:
-                # Convert to float32 and normalize
-                audio_float = audio_data.astype(np.float32) / 32768.0
-                sf.write(temp_file.name, audio_float, sample_rate)
-                
-                # Read the file for Deepgram
-                with open(temp_file.name, 'rb') as audio_file:
-                    buffer_data = audio_file.read()
-                
-                # Clean up temp file
-                os.unlink(temp_file.name)
-            
-            # Configure Deepgram options
-            options = PrerecordedOptions(
-                model=self.model,
-                language=self.language,
-                smart_format=self.smart_format,
-                punctuate=self.punctuate,
-                diarize=False,
-                multichannel=False
-            )
-            
-            # Create file source
-            payload: FileSource = {
-                "buffer": buffer_data,
-            }
-            
-            # Make API call
-            response = self.client.listen.prerecorded.v("1").transcribe_file(
-                payload, options
-            )
-            
-            # Extract transcript
-            if response.results and response.results.channels:
-                transcript = response.results.channels[0].alternatives[0].transcript
-                return transcript.strip()
-            
-            return ""
-            
-        except Exception as e:
-            print(f"Deepgram transcription error: {e}")
-            return ""
+        return ""
     
-    def transcribe_streaming(self, audio_chunk: np.ndarray, sample_rate: int = 16000) -> str:
-        """
-        Transcribe a streaming audio chunk using Deepgram.
-        For streaming, we'll use the same method as regular transcription.
-        
-        Args:
-            audio_chunk: Audio chunk as numpy array
-            sample_rate: Sample rate of the audio
-            
-        Returns:
-            Transcribed text for this chunk
-        """
-        return self.transcribe(audio_chunk, sample_rate)
+    def transcribe_streaming(self, audio_chunk, sample_rate: int = 16000) -> str:
+        return ""
     
     def get_supported_languages(self) -> list:
         """Get list of supported languages."""

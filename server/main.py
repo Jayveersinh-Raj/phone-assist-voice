@@ -1,151 +1,28 @@
 import os
 import sys
-import numpy as np
-from fastapi import FastAPI, UploadFile, File
+from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
-from .stt.factory import STTFactory
-from .indic_trans import translate_en_hi  # existing function
-from dotenv import load_dotenv
-import openai
-from .schemas.schema import TextRequest
-import time
+from fastapi import WebSocket, WebSocketDisconnect
+from dotenv import load_dotenv, find_dotenv
+import asyncio
+from .stt import STTFactory
 
-# Load env vars
-load_dotenv()
-openai.api_key = os.getenv("OPENAI_API_KEY")
+# Load env vars from repo-level .env (auto-discover), overriding existing vars if provided
+load_dotenv(find_dotenv(), override=True)
 
+# Also load server-local .env explicitly
+_server_env = os.path.join(os.path.dirname(__file__), '.env')
+if os.path.exists(_server_env):
+    load_dotenv(_server_env, override=True)
 app = FastAPI()
 
-# Initialize STT provider
-stt_provider_type = os.getenv("STT_PROVIDER", "whisper")  # Default to whisper
-stt_config = {}
 
-if stt_provider_type == "deepgram":
-    stt_config = {
-        "api_key": os.getenv("DEEPGRAM_API_KEY"),
-        "language": os.getenv("STT_LANGUAGE", "en"),
-        "model": os.getenv("DEEPGRAM_MODEL", "nova-2")
-    }
-elif stt_provider_type == "whisper":
-    stt_config = {
-        "model": os.getenv("WHISPER_MODEL", "tiny"),
-        "language": os.getenv("STT_LANGUAGE", "en"),
-        "compute_type": os.getenv("WHISPER_COMPUTE_TYPE", "int8")
-    }
-
-try:
-    stt_provider = STTFactory.create_provider(stt_provider_type, stt_config)
-    print(f"[🔊] STT Provider initialized: {stt_provider_type}")
-except Exception as e:
-    print(f"[❌] Failed to initialize STT provider: {e}")
-    # Fallback to whisper if available
-    try:
-        stt_provider = STTFactory.create_provider("whisper", {"model": "tiny"})
-        print("[🔊] Fallback to Whisper STT provider")
-    except Exception as fallback_error:
-        print(f"[❌] Fallback failed: {fallback_error}")
-        stt_provider = None
-
-# Buffer and previous transcript
-audio_buffer = []
-prev_transcript = ""
-
-print("[🔊] Ready to receive audio chunks.")
-sys.stdout.flush()
+@app.get("/health")
+def health():
+    return {"status": "ok"}
 
 
-# -----------------------------
-# Helper: OpenAI translation
-# -----------------------------
-client = openai.OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-def translate_with_openai(text: str, target_language: str, source_language: str = None) -> str:
-    if source_language:
-        user_instr = (
-            f"Translate the following text from {source_language} to {target_language}. "
-            f"Output only the translated text, with no additional commentary, labels, or explanations.\n\n"
-            f"{text}"
-        )
-    else:
-        user_instr = (
-            f"Translate the following text into {target_language}. "
-            f"Output only the translated text, with no additional commentary, labels, or explanations.\n\n"
-            f"{text}"
-        )
-
-    response = client.chat.completions.create(
-        model="gpt-3.5-turbo",
-        messages=[
-            {
-                "role": "system",
-                "content": "You are a translation assistant. You must only output the translated result exactly, nothing else.",
-            },
-            {"role": "user", "content": user_instr},
-        ],
-        temperature=0.0,
-        max_tokens=1000,
-    )
-
-    return response.choices[0].message.content.strip()
-
-# -----------------------------
-# Endpoints
-# -----------------------------
-@app.post("/stream/chunk")
-async def stream_chunk(chunk: UploadFile = File(...)):
-    global prev_transcript
     
-    if stt_provider is None:
-        return JSONResponse(content={"error": "STT provider not available"}, status_code=500)
-    
-    data = await chunk.read()
-    pcm_data = np.frombuffer(data, dtype=np.int16)
-
-    # Append new PCM data to buffer
-    audio_buffer.extend(pcm_data)
-
-    # Limit buffer to last 5 seconds (16kHz × 5s = 80,000 samples)
-    if len(audio_buffer) > 80000:
-        audio_buffer[:] = audio_buffer[-80000:]
-
-    buffer_np = np.array(audio_buffer, dtype=np.int16)
-    current_transcript = stt_provider.transcribe(buffer_np)
-
-    if current_transcript.startswith(prev_transcript):
-        new_part = current_transcript[len(prev_transcript):].strip()
-    else:
-        new_part = current_transcript
-
-    prev_transcript = current_transcript
-
-    if new_part:
-        print(f"[🗣️ New] {new_part}")
-        sys.stdout.flush()
-        return {"transcript": new_part}
-
-    return JSONResponse(content={"status": "waiting"}, status_code=200)
-
-
-@app.post("/translate")
-def translate(req: TextRequest):
-    try:
-        translated = translate_en_hi(req.text, req.src_lang, req.tgt_lang)
-        return {"translated": translated}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/translate/openai")
-def translate_openai(req: TextRequest):
-    try:
-        start = time.time()
-        translated = translate_with_openai(req.text, req.tgt_lang, req.src_lang)
-        end = time.time()
-        print(f"Latency: {end - start}")
-        print(f"Translated: {translated}")
-        return {"translated": translated}
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
 # -----------------------------
@@ -164,55 +41,108 @@ def get_available_providers():
         return JSONResponse(content={"error": str(e)}, status_code=500)
 
 
-@app.get("/stt/current")
-def get_current_provider():
-    """Get information about the current STT provider."""
+# -----------------------------
+# WebSocket: Deepgram Streaming
+# -----------------------------
+@app.websocket("/ws/transcribe")
+async def ws_transcribe(websocket: WebSocket):
+    await websocket.accept()
+
+    # Lazy import to avoid hard dependency when not used
     try:
-        if stt_provider is None:
-            return JSONResponse(content={"error": "No STT provider available"}, status_code=500)
-        
-        return {
-            "provider_type": stt_provider_type,
-            "config": stt_provider.get_config(),
-            "supported_languages": stt_provider.get_supported_languages()
-        }
+        from deepgram import AsyncDeepgramClient
+        from deepgram.core.events import EventType
+        from deepgram.extensions.types.sockets import ListenV1ResultsEvent
     except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
+        await websocket.send_json({"error": f"Deepgram SDK not available: {e}"})
+        await websocket.close()
+        return
+
+    api_key = os.getenv("DEEPGRAM_API_KEY")
+    if not api_key:
+        await websocket.send_json({"error": "DEEPGRAM_API_KEY not set"})
+        await websocket.close()
+        return
+
+    try:
+        dg = AsyncDeepgramClient(api_key=api_key)
+        model = os.getenv("DEEPGRAM_MODEL", "nova-2")
+        language = os.getenv("STT_LANGUAGE", "en")
+
+        # Track final sentence assembly
+        final_sentences = []
+        
+        # Open Deepgram listen v1 websocket
+        async with dg.listen.v1.connect(
+            model=model,
+            language=language,
+            encoding="linear16",
+            sample_rate="16000",
+            interim_results="true",
+            punctuate="true",
+            smart_format="true",
+        ) as dg_socket:
+
+            # Handle incoming messages
+            async def handle_message(message):
+                try:
+                    if isinstance(message, ListenV1ResultsEvent):
+                        alt = message.channel.alternatives[0] if message.channel.alternatives else None
+                        text = alt.transcript if alt else ""
+                        is_final = bool(message.is_final)
+                        if not text:
+                            return
+                        if is_final:
+                            print(f"[Final] {text}")
+                            final_sentences.append(text)
+                            await websocket.send_json({"final": text})
+                        else:
+                            print(f"[Partial] {text}")
+                            await websocket.send_json({"partial": text})
+                        sys.stdout.flush()
+                except Exception:
+                    pass
+
+            dg_socket.on(EventType.MESSAGE, handle_message)
+
+            # Start listening in background
+            listen_task = asyncio.create_task(dg_socket.start_listening())
+
+            # Receive audio frames from client and forward to Deepgram
+            try:
+                while True:
+                    data = await websocket.receive_bytes()
+                    if not data:
+                        continue
+                    await dg_socket.send_media(data)
+            except WebSocketDisconnect:
+                pass
+            except Exception as e:
+                try:
+                    await websocket.send_json({"error": str(e)})
+                except Exception:
+                    pass
+            finally:
+                # Finalize and close
+                try:
+                    listen_task.cancel()
+                except Exception:
+                    pass
+                try:
+                    if final_sentences:
+                        await websocket.send_json({"final_full": " ".join(final_sentences).strip()})
+                except Exception:
+                    pass
+                try:
+                    await websocket.close()
+                except Exception:
+                    pass
+    except Exception as e:
+        try:
+            await websocket.send_json({"error": f"Failed to start Deepgram live: {e}"})
+            await websocket.close()
+        except Exception:
+            pass
 
 
-@app.post("/stt/switch")
-def switch_provider(provider_type: str, config: dict = None):
-    """Switch to a different STT provider."""
-    global stt_provider, stt_provider_type
     
-    try:
-        if provider_type not in STTFactory.get_available_providers():
-            return JSONResponse(content={"error": f"Provider '{provider_type}' not available"}, status_code=400)
-        
-        new_provider = STTFactory.create_provider(provider_type, config or {})
-        stt_provider = new_provider
-        stt_provider_type = provider_type
-        
-        return {
-            "message": f"Switched to {provider_type} provider",
-            "provider_type": provider_type,
-            "config": stt_provider.get_config()
-        }
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)
-
-
-@app.post("/stt/language")
-def set_stt_language(language: str):
-    """Set the language for STT transcription."""
-    try:
-        if stt_provider is None:
-            return JSONResponse(content={"error": "No STT provider available"}, status_code=500)
-        
-        stt_provider.set_language(language)
-        return {
-            "message": f"Language set to {language}",
-            "language": language
-        }
-    except Exception as e:
-        return JSONResponse(content={"error": str(e)}, status_code=500)

@@ -1,6 +1,7 @@
 import pyaudio
-import requests
 import time
+import asyncio
+import websockets
 
 CHUNK_DURATION_MS = 5000  # 5 seconds
 SAMPLE_RATE = 16000
@@ -8,9 +9,9 @@ SAMPLE_WIDTH = 2  # bytes (16-bit)
 CHANNELS = 1
 CHUNK_SIZE = int(SAMPLE_RATE * CHUNK_DURATION_MS / 1000)
 
-SERVER_URL = "http://localhost:8000/stream/chunk"
+SERVER_WS_URL = "ws://localhost:8000/ws/transcribe"
 
-def stream_from_microphone():
+async def stream_ws_from_microphone():
     p = pyaudio.PyAudio()
 
     stream = p.open(format=pyaudio.paInt16,
@@ -22,25 +23,38 @@ def stream_from_microphone():
     print("[🎤] Recording from microphone... Press Ctrl+C to stop")
 
     try:
-        while True:
-            start = time.time()
+        async with websockets.connect(SERVER_WS_URL, max_size=None) as ws:
+            async def receiver():
+                try:
+                    async for message in ws:
+                        # Server sends JSON; websockets delivers str
+                        try:
+                            import json as _json
+                            payload = _json.loads(message)
+                            if 'partial' in payload:
+                                print(f"[Partial] {payload['partial']}")
+                            if 'final' in payload:
+                                print(f"[Final] {payload['final']}")
+                            if 'final_full' in payload:
+                                print(f"[Sentence] {payload['final_full']}")
+                            if 'error' in payload:
+                                print(f"[Error] {payload['error']}")
+                        except Exception:
+                            print(message)
+                except Exception:
+                    pass
 
-            # Read raw audio data from mic
-            audio_chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+            recv_task = asyncio.create_task(receiver())
 
-            files = {
-                "chunk": ("chunk.pcm", audio_chunk, "application/octet-stream")
-            }
-            response = requests.post(SERVER_URL, files=files)
+            while True:
+                start = time.time()
+                audio_chunk = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+                await ws.send(audio_chunk)
+                end = time.time()
+                # Optional pacing/logging
+                # print(f"Sent {len(audio_chunk)} bytes in {end-start:.3f}s")
 
-            if response.ok:
-                json = response.json()
-                if "transcript" in json:
-                    print(f"[Transcript] {json['transcript']}")
-                    end = time.time()
-                    print(f"⏱️ Time taken: {end - start:.2f} sec")
-            else:
-                print(f"[⚠️] Server error: {response.status_code} - {response.text}")
+            await recv_task
 
     except KeyboardInterrupt:
         print("\n[🛑] Stopped by user.")
@@ -50,7 +64,12 @@ def stream_from_microphone():
         p.terminate()
 
 if __name__ == "__main__":
-    stream_from_microphone()
+    try:
+        asyncio.run(stream_ws_from_microphone())
+    except RuntimeError:
+        # For environments where an event loop is already running
+        loop = asyncio.get_event_loop()
+        loop.run_until_complete(stream_ws_from_microphone())
 
 
 
